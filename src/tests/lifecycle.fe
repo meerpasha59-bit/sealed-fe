@@ -1,0 +1,668 @@
+// End-to-end auctions on the test EVM, driven through every phase by the
+// `TimedAuction` harness and real `Bidder` accounts.
+
+use ingot::AuctionMsg
+use ingot::types::Commitment
+use ingot::tests::harness::{Bidder, BidderMsg, TimedAuction, WarpMsg}
+use std::evm::{days, ether, hours, seconds}
+
+const START: u256 = 1_000_000
+const SALT_A: u256 = 0xa
+const SALT_B: u256 = 0xb
+const SALT_C: u256 = 0xc
+
+pub fn start() -> Timestamp {
+    Timestamp::from_seconds(START)
+}
+pub fn commit_end() -> Timestamp {
+    start() + days(1)
+}
+pub fn reveal_end() -> Timestamp {
+    commit_end() + hours(1)
+}
+
+/// Deploy a harness auction (commit 1 day, reveal 1 hour) owned by the test.
+pub fn deploy(reserve: Wei, salt: u256) -> Address uses (evm: mut Evm) {
+    evm.create2<TimedAuction>(
+        value: Wei::zero(),
+        args: (start(), days(1), hours(1), reserve),
+        salt,
+    )
+}
+
+pub fn bidder(_ salt: u256) -> Address uses (evm: mut Evm) {
+    evm.create2<Bidder>(value: Wei::zero(), args: (), salt)
+}
+
+pub fn warp(auction: Address, to: Timestamp) uses (evm: mut Evm) {
+    evm.call(
+        addr: auction,
+        gas: 100000,
+        value: Wei::zero(),
+        message: WarpMsg::Warp { to },
+    )
+}
+
+pub fn place(auction: Address, who: Address, amount: Wei, salt: u256, deposit: Wei)
+uses (evm: mut Evm)
+{
+    let c = Commitment::of(auction, bidder: who, amount, salt)
+    evm.call(
+        addr: who,
+        gas: 500000,
+        value: deposit,
+        message: BidderMsg::DoCommit { auction, commitment: c.0 },
+    )
+}
+
+pub fn open(auction: Address, who: Address, amount: Wei, salt: u256) -> bool
+uses (evm: mut Evm)
+{
+    evm.call(
+        addr: who,
+        gas: 500000,
+        value: Wei::zero(),
+        message: BidderMsg::DoReveal { auction, amount, salt },
+    )
+}
+
+pub fn pull(auction: Address, who: Address, to: Address) -> Wei
+uses (evm: mut Evm)
+{
+    evm.call(
+        addr: who,
+        gas: 500000,
+        value: Wei::zero(),
+        message: BidderMsg::DoWithdraw { auction, to },
+    )
+}
+
+pub fn settle_now(auction: Address) -> Wei uses (evm: mut Evm) {
+    evm.call(
+        addr: auction,
+        gas: 300000,
+        value: Wei::zero(),
+        message: AuctionMsg::Settle {},
+    )
+}
+
+pub fn phase(auction: Address) -> u8 uses (evm: mut Evm) {
+    evm.call(
+        addr: auction,
+        gas: 100000,
+        value: Wei::zero(),
+        message: AuctionMsg::Phase {},
+    )
+}
+
+pub fn claimable_of(auction: Address, account: Address) -> Wei uses (evm: mut Evm) {
+    evm.call(
+        addr: auction,
+        gas: 100000,
+        value: Wei::zero(),
+        message: AuctionMsg::Claimable { account },
+    )
+}
+
+pub fn winner_of(auction: Address) -> Address uses (evm: mut Evm) {
+    evm.call(
+        addr: auction,
+        gas: 100000,
+        value: Wei::zero(),
+        message: AuctionMsg::Winner {},
+    )
+}
+
+pub fn price_of(auction: Address) -> Wei uses (evm: mut Evm) {
+    evm.call(
+        addr: auction,
+        gas: 100000,
+        value: Wei::zero(),
+        message: AuctionMsg::Price {},
+    )
+}
+
+/// Withdraw the seller's (this test contract's) payout to `to`.
+pub fn seller_pull(auction: Address, to: Address) -> Wei uses (evm: mut Evm) {
+    evm.call(
+        addr: auction,
+        gas: 300000,
+        value: Wei::zero(),
+        message: AuctionMsg::Withdraw { to },
+    )
+}
+
+// --- Full auctions ---------------------------------------------------------------
+
+#[test(balance = 100_000_000_000_000_000_000)]
+fn three_bidders_full_lifecycle() uses (evm: mut Evm) {
+    let auction = deploy(reserve: ether(1), salt: 0)
+    let a = bidder(1)
+    let b = bidder(2)
+    let c = bidder(3)
+    assert!(phase(auction) == 0)
+
+    // Commit: deposits hide the bids (b deposits 10 to bid 7).
+    place(
+        auction,
+        who: a,
+        amount: ether(3),
+        salt: SALT_A,
+        deposit: ether(3),
+    )
+    place(
+        auction,
+        who: b,
+        amount: ether(7),
+        salt: SALT_B,
+        deposit: ether(10),
+    )
+    place(
+        auction,
+        who: c,
+        amount: ether(5),
+        salt: SALT_C,
+        deposit: ether(6),
+    )
+    let n: u256 = evm
+        .call(
+            addr: auction,
+            gas: 100000,
+            value: Wei::zero(),
+            message: AuctionMsg::Bidders {},
+        )
+    assert!(n == 3)
+    assert!(evm.balance(auction) == ether(19))
+
+    // Reveal, in an order where the lead changes hands.
+    warp(auction, to: commit_end())
+    assert!(phase(auction) == 1)
+    assert!(open(auction, who: a, amount: ether(3), salt: SALT_A))
+    assert!(open(auction, who: b, amount: ether(7), salt: SALT_B))
+    assert!(!open(auction, who: c, amount: ether(5), salt: SALT_C))
+
+    // Settle: b wins, pays c's 5.
+    warp(auction, to: reveal_end())
+    assert!(phase(auction) == 2)
+    assert!(settle_now(auction) == ether(5))
+    assert!(phase(auction) == 3)
+    assert!(winner_of(auction) == b)
+    assert!(price_of(auction) == ether(5))
+
+    // Withdraw: everything goes back out, nothing stays in the contract.
+    let pa = Address::new(0xaaa1)
+    let pb = Address::new(0xbbb1)
+    let pc = Address::new(0xccc1)
+    let ps = Address::new(0x5e11)
+    assert!(claimable_of(auction, account: b) == ether(5))
+    assert!(pull(auction, who: a, to: pa) == ether(3))
+    assert!(pull(auction, who: b, to: pb) == ether(5))
+    assert!(pull(auction, who: c, to: pc) == ether(6))
+    assert!(seller_pull(auction, to: ps) == ether(5))
+    assert!(evm.balance(pa) == ether(3))
+    assert!(evm.balance(pb) == ether(5))
+    assert!(evm.balance(pc) == ether(6))
+    assert!(evm.balance(ps) == ether(5))
+    assert!(evm.balance(auction) == Wei::zero())
+    assert!(claimable_of(auction, account: b) == Wei::zero())
+}
+
+#[test(balance = 100_000_000_000_000_000_000)]
+fn unrevealed_deposit_goes_to_seller() uses (evm: mut Evm) {
+    let auction = deploy(reserve: ether(1), salt: 0)
+    let a = bidder(1)
+    let b = bidder(2)
+    place(
+        auction,
+        who: a,
+        amount: ether(2),
+        salt: SALT_A,
+        deposit: ether(2),
+    )
+    place(
+        auction,
+        who: b,
+        amount: ether(9),
+        salt: SALT_B,
+        deposit: ether(9),
+    )
+    warp(auction, to: commit_end())
+    open(auction, who: a, amount: ether(2), salt: SALT_A)
+    // b never reveals.
+    warp(auction, to: reveal_end())
+    assert!(settle_now(auction) == ether(1))
+    assert!(winner_of(auction) == a)
+    assert!(claimable_of(auction, account: b) == Wei::zero())
+    assert!(claimable_of(auction, account: a) == ether(1))
+    assert!(claimable_of(auction, account: evm.address()) == ether(10))
+    let ps = Address::new(0x5e11)
+    assert!(seller_pull(auction, to: ps) == ether(10))
+    assert!(
+        pull(auction, who: a, to: Address::new(0xaaa1)) == ether(1),
+    )
+    assert!(evm.balance(auction) == Wei::zero())
+}
+
+#[test(balance = 100_000_000_000_000_000_000)]
+fn no_sale_below_reserve_refunds_everyone() uses (evm: mut Evm) {
+    let auction = deploy(reserve: ether(50), salt: 0)
+    let a = bidder(1)
+    let b = bidder(2)
+    place(
+        auction,
+        who: a,
+        amount: ether(2),
+        salt: SALT_A,
+        deposit: ether(2),
+    )
+    place(
+        auction,
+        who: b,
+        amount: ether(9),
+        salt: SALT_B,
+        deposit: ether(9),
+    )
+    warp(auction, to: commit_end())
+    open(auction, who: a, amount: ether(2), salt: SALT_A)
+    open(auction, who: b, amount: ether(9), salt: SALT_B)
+    warp(auction, to: reveal_end())
+    assert!(settle_now(auction) == Wei::zero())
+    assert!(winner_of(auction) == Address::zero())
+    assert!(claimable_of(auction, account: a) == ether(2))
+    assert!(claimable_of(auction, account: b) == ether(9))
+    assert!(
+        claimable_of(auction, account: evm.address()) == Wei::zero(),
+    )
+    pull(auction, who: a, to: Address::new(0xaaa1))
+    pull(auction, who: b, to: Address::new(0xbbb1))
+    assert!(evm.balance(auction) == Wei::zero())
+}
+
+#[test]
+fn auction_with_no_bids_settles_to_nothing() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    warp(auction, to: reveal_end())
+    assert!(settle_now(auction) == Wei::zero())
+    assert!(phase(auction) == 3)
+    assert!(winner_of(auction) == Address::zero())
+}
+
+#[test(balance = 100_000_000_000_000_000_000)]
+fn single_bidder_pays_reserve() uses (evm: mut Evm) {
+    let auction = deploy(reserve: ether(2), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: ether(8),
+        salt: SALT_A,
+        deposit: ether(8),
+    )
+    warp(auction, to: commit_end())
+    open(auction, who: a, amount: ether(8), salt: SALT_A)
+    warp(auction, to: reveal_end())
+    assert!(settle_now(auction) == ether(2))
+    assert!(
+        pull(auction, who: a, to: Address::new(0xaaa1)) == ether(6),
+    )
+}
+
+#[test(balance = 100_000_000_000_000_000_000)]
+fn equal_bids_first_revealer_wins_at_that_price() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    let b = bidder(2)
+    place(
+        auction,
+        who: a,
+        amount: ether(4),
+        salt: SALT_A,
+        deposit: ether(4),
+    )
+    place(
+        auction,
+        who: b,
+        amount: ether(4),
+        salt: SALT_B,
+        deposit: ether(4),
+    )
+    warp(auction, to: commit_end())
+    open(auction, who: b, amount: ether(4), salt: SALT_B)
+    open(auction, who: a, amount: ether(4), salt: SALT_A)
+    warp(auction, to: reveal_end())
+    assert!(settle_now(auction) == ether(4))
+    assert!(winner_of(auction) == b)
+}
+
+#[test(balance = 100_000_000_000_000_000_000)]
+fn reveal_on_last_second_counts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: ether(1),
+        salt: SALT_A,
+        deposit: ether(1),
+    )
+    warp(auction, to: reveal_end() - seconds(1))
+    assert!(open(auction, who: a, amount: ether(1), salt: SALT_A))
+}
+
+#[test(balance = 100_000_000_000_000_000_000)]
+fn commit_on_last_second_counts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    warp(auction, to: commit_end() - seconds(1))
+    place(
+        auction,
+        who: a,
+        amount: ether(1),
+        salt: SALT_A,
+        deposit: ether(1),
+    )
+    assert!(phase(auction) == 0)
+}
+
+// --- Failure paths (each reverts with a precise custom error) ------------------
+
+// WrongPhase(uint8,uint8) = 0x05fb5e1b
+#[test(should_revert, selector = 0x05fb5e1b, balance = 100_000_000_000_000_000_000)]
+fn commit_after_deadline_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    warp(auction, to: commit_end())
+    place(
+        auction,
+        who: a,
+        amount: ether(1),
+        salt: SALT_A,
+        deposit: ether(1),
+    )
+}
+
+#[test(should_revert, selector = 0x05fb5e1b, balance = 100_000_000_000_000_000_000)]
+fn reveal_during_commit_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: ether(1),
+        salt: SALT_A,
+        deposit: ether(1),
+    )
+    open(auction, who: a, amount: ether(1), salt: SALT_A)
+}
+
+#[test(should_revert, selector = 0x05fb5e1b, balance = 100_000_000_000_000_000_000)]
+fn late_reveal_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: ether(1),
+        salt: SALT_A,
+        deposit: ether(1),
+    )
+    warp(auction, to: reveal_end())
+    open(auction, who: a, amount: ether(1), salt: SALT_A)
+}
+
+#[test(should_revert, selector = 0x05fb5e1b)]
+fn settle_during_reveal_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    warp(auction, to: commit_end())
+    settle_now(auction)
+}
+
+#[test(should_revert, selector = 0x05fb5e1b)]
+fn settle_twice_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    warp(auction, to: reveal_end())
+    settle_now(auction)
+    settle_now(auction)
+}
+
+#[test(should_revert, selector = 0x05fb5e1b, balance = 100_000_000_000_000_000_000)]
+fn withdraw_before_settle_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: ether(1),
+        salt: SALT_A,
+        deposit: ether(1),
+    )
+    warp(auction, to: reveal_end())
+    pull(auction, who: a, to: Address::new(0xaaa1))
+}
+
+// AlreadyCommitted(address) = 0x64dbd987
+#[test(should_revert, selector = 0x64dbd987, balance = 100_000_000_000_000_000_000)]
+fn second_commit_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: ether(1),
+        salt: SALT_A,
+        deposit: ether(1),
+    )
+    place(
+        auction,
+        who: a,
+        amount: ether(2),
+        salt: SALT_B,
+        deposit: ether(2),
+    )
+}
+
+// EmptyCommit() = 0x37b5b73d
+#[test(should_revert, selector = 0x37b5b73d)]
+fn commit_without_deposit_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: ether(1),
+        salt: SALT_A,
+        deposit: Wei::zero(),
+    )
+}
+
+#[test(should_revert, selector = 0x37b5b73d, balance = 100_000_000_000_000_000_000)]
+fn empty_commitment_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    evm.call(
+        addr: a,
+        gas: 500000,
+        value: ether(1),
+        message: BidderMsg::DoCommit { auction, commitment: 0 },
+    )
+}
+
+// SellerCannotBid() = 0xef025889
+#[test(should_revert, selector = 0xef025889, balance = 100_000_000_000_000_000_000)]
+fn seller_cannot_bid() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let c = Commitment::of(auction, bidder: evm.address(), amount: ether(1), salt: 1)
+    evm.call(
+        addr: auction,
+        gas: 300000,
+        value: ether(1),
+        message: AuctionMsg::Commit { commitment: c.0 },
+    )
+}
+
+// NoCommitment(address) = 0x405dd5a7
+#[test(should_revert, selector = 0x405dd5a7)]
+fn reveal_without_commit_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    warp(auction, to: commit_end())
+    open(auction, who: a, amount: ether(1), salt: SALT_A)
+}
+
+// CommitmentMismatch() = 0x5054097b
+#[test(should_revert, selector = 0x5054097b, balance = 100_000_000_000_000_000_000)]
+fn reveal_with_wrong_salt_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: ether(1),
+        salt: SALT_A,
+        deposit: ether(1),
+    )
+    warp(auction, to: commit_end())
+    open(auction, who: a, amount: ether(1), salt: SALT_B)
+}
+
+#[test(should_revert, selector = 0x5054097b, balance = 100_000_000_000_000_000_000)]
+fn reveal_with_different_amount_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: ether(1),
+        salt: SALT_A,
+        deposit: ether(5),
+    )
+    warp(auction, to: commit_end())
+    open(auction, who: a, amount: ether(4), salt: SALT_A)
+}
+
+#[test(should_revert, selector = 0x5054097b, balance = 100_000_000_000_000_000_000)]
+fn copied_commitment_cannot_be_revealed_by_another_account()
+uses (evm: mut Evm)
+{
+    // b copies a's commitment hash; it is bound to a's address, so b can't open it.
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    let b = bidder(2)
+    let c = Commitment::of(auction, bidder: a, amount: ether(1), salt: SALT_A)
+    evm.call(
+        addr: a,
+        gas: 500000,
+        value: ether(1),
+        message: BidderMsg::DoCommit { auction, commitment: c.0 },
+    )
+    evm.call(
+        addr: b,
+        gas: 500000,
+        value: ether(1),
+        message: BidderMsg::DoCommit { auction, commitment: c.0 },
+    )
+    warp(auction, to: commit_end())
+    open(auction, who: b, amount: ether(1), salt: SALT_A)
+}
+
+// AlreadyRevealed() = 0xa89ac151
+#[test(should_revert, selector = 0xa89ac151, balance = 100_000_000_000_000_000_000)]
+fn double_reveal_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: ether(1),
+        salt: SALT_A,
+        deposit: ether(1),
+    )
+    warp(auction, to: commit_end())
+    open(auction, who: a, amount: ether(1), salt: SALT_A)
+    open(auction, who: a, amount: ether(1), salt: SALT_A)
+}
+
+// InvalidBid(uint256,uint256) = 0xeb302bb1
+#[test(should_revert, selector = 0xeb302bb1, balance = 100_000_000_000_000_000_000)]
+fn bid_above_deposit_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: ether(5),
+        salt: SALT_A,
+        deposit: ether(1),
+    )
+    warp(auction, to: commit_end())
+    open(auction, who: a, amount: ether(5), salt: SALT_A)
+}
+
+#[test(should_revert, selector = 0xeb302bb1, balance = 100_000_000_000_000_000_000)]
+fn zero_bid_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: Wei::zero(),
+        salt: SALT_A,
+        deposit: ether(1),
+    )
+    warp(auction, to: commit_end())
+    open(auction, who: a, amount: Wei::zero(), salt: SALT_A)
+}
+
+// NothingToWithdraw() = 0xd0d04f60
+#[test(should_revert, selector = 0xd0d04f60, balance = 100_000_000_000_000_000_000)]
+fn double_withdraw_reverts() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    let b = bidder(2)
+    place(
+        auction,
+        who: a,
+        amount: ether(1),
+        salt: SALT_A,
+        deposit: ether(1),
+    )
+    place(
+        auction,
+        who: b,
+        amount: ether(2),
+        salt: SALT_B,
+        deposit: ether(2),
+    )
+    warp(auction, to: commit_end())
+    open(auction, who: a, amount: ether(1), salt: SALT_A)
+    open(auction, who: b, amount: ether(2), salt: SALT_B)
+    warp(auction, to: reveal_end())
+    settle_now(auction)
+    pull(auction, who: a, to: Address::new(0xaaa1))
+    pull(auction, who: a, to: Address::new(0xaaa1))
+}
+
+#[test(should_revert, selector = 0xd0d04f60, balance = 100_000_000_000_000_000_000)]
+fn unrevealed_bidder_cannot_withdraw() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: ether(1),
+        salt: SALT_A,
+        deposit: ether(1),
+    )
+    warp(auction, to: reveal_end())
+    settle_now(auction)
+    pull(auction, who: a, to: Address::new(0xaaa1))
+}
+
+#[test(should_revert, selector = 0xd0d04f60)]
+fn stranger_cannot_withdraw() uses (evm: mut Evm) {
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    warp(auction, to: reveal_end())
+    settle_now(auction)
+    pull(auction, who: a, to: Address::new(0xaaa1))
+}

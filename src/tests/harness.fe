@@ -1,0 +1,180 @@
+// Test-only contracts.
+//
+// `TimedAuction` speaks the same `AuctionMsg` ABI as `SealedAuction` and
+// calls the same `auction.fe` functions, but takes its `Clock` from a stored
+// timestamp that tests move with `warp(t)`. Fe's test EVM has no time cheat
+// code, and it doesn't need one: time is an effect, so the harness just
+// provides a different clock.
+//
+// `Bidder` is a minimal account contract so that each test bidder has its own
+// address (`ctx.caller()` in the auction).
+
+use ingot::AuctionMsg
+use ingot::types::{Clock, Commitment, FixedClock, Schedule, current_phase}
+use ingot::auction::{AuctionStore, claimable, commit, reveal, settle, setup, take_payout}
+
+pub msg WarpMsg {
+    #[selector = sol("warp(uint256)")]
+    Warp { to: Timestamp },
+    #[selector = sol("now()")]
+    Now -> Timestamp,
+}
+
+pub contract TimedAuction uses (ctx: Ctx, call: mut Call) {
+    mut store: AuctionStore,
+    mut now: Timestamp,
+
+    init(start: Timestamp, commit_period: Duration, reveal_period: Duration, reserve: Wei)
+    uses (ctx, mut store, mut now)
+    {
+        now = start
+        with (store) {
+            setup(
+                seller: ctx.caller(),
+                schedule: Schedule::starting(at: start, commit_period, reveal_period),
+                reserve,
+            )
+        }
+    }
+
+    recv WarpMsg {
+        Warp { to } uses (mut now) {
+            now = to
+        }
+        Now -> Timestamp uses (now) {
+            now
+        }
+    }
+
+    recv AuctionMsg {
+        #[payable]
+        Commit { commitment } uses (ctx, mut store, now) {
+            with (Clock = FixedClock { at: now }, store) {
+                commit(
+                    bidder: ctx.caller(),
+                    commitment: Commitment(commitment),
+                    deposit: ctx.value(),
+                )
+            }
+        }
+        Reveal { amount, salt } -> bool uses (ctx, mut store, now) {
+            with (Clock = FixedClock { at: now }, store) {
+                reveal(auction: ctx.address(), bidder: ctx.caller(), amount, salt)
+            }
+        }
+        Settle -> Wei uses (mut store, now) {
+            with (Clock = FixedClock { at: now }, store) {
+                settle()
+            }
+        }
+        Withdraw { to } -> Wei uses (ctx, mut call, mut store, now) {
+            let amount = with (Clock = FixedClock { at: now }, store) {
+                take_payout(ctx.caller())
+            }
+            assert!(
+                call.send_value(addr: to, gas: 0, value: amount).success(),
+                "Transfer failed",
+            )
+            amount
+        }
+        Phase -> u8 uses (store, now) {
+            with (Clock = FixedClock { at: now }) {
+                current_phase(schedule: store.schedule, settled: store.settled).code()
+            }
+        }
+        Winner -> Address uses (store) {
+            if store.settled && store.price == Wei::zero() {
+                Address::zero()
+            } else {
+                store.book.winner
+            }
+        }
+        Price -> Wei uses (store) {
+            store.price
+        }
+        HighestBid -> Wei uses (store) {
+            store.book.highest
+        }
+        Claimable { account } -> Wei uses (store) {
+            with (store) {
+                claimable(account)
+            }
+        }
+        CommitmentOf { bidder } -> u256 uses (store) {
+            store.commitments.get(key: bidder).0
+        }
+        DepositOf { bidder } -> Wei uses (store) {
+            store.deposits.get(key: bidder)
+        }
+        Bidders -> u256 uses (store) {
+            store.bidders
+        }
+        Reveals -> u256 uses (store) {
+            store.book.reveals
+        }
+        CommitEnd -> Timestamp uses (store) {
+            store.schedule.commit_end
+        }
+        RevealEnd -> Timestamp uses (store) {
+            store.schedule.reveal_end
+        }
+        Seller -> Address uses (store) {
+            store.seller
+        }
+        Reserve -> Wei uses (store) {
+            store.reserve
+        }
+    }
+}
+
+pub msg BidderMsg {
+    #[selector = sol("doCommit(address,uint256)")]
+    DoCommit { auction: Address, commitment: u256 },
+    #[selector = sol("doReveal(address,uint256,uint256)")]
+    DoReveal { auction: Address, amount: Wei, salt: u256 } -> bool,
+    #[selector = sol("doWithdraw(address,address)")]
+    DoWithdraw { auction: Address, to: Address } -> Wei,
+    #[selector = sol("doSettle(address)")]
+    DoSettle { auction: Address } -> Wei,
+}
+
+/// A bidder account: forwards calls (and ETH) to an auction.
+pub contract Bidder uses (ctx: Ctx, call: mut Call) {
+    recv BidderMsg {
+        #[payable]
+        DoCommit { auction, commitment } uses (ctx, mut call) {
+            call.call(
+                addr: auction,
+                gas: 300000,
+                value: ctx.value(),
+                message: AuctionMsg::Commit { commitment },
+            )
+        }
+        DoReveal { auction, amount, salt } -> bool
+        uses (mut call)
+        {
+            call.call(
+                addr: auction,
+                gas: 300000,
+                value: Wei::zero(),
+                message: AuctionMsg::Reveal { amount, salt },
+            )
+        }
+        DoWithdraw { auction, to } -> Wei uses (mut call) {
+            call.call(
+                addr: auction,
+                gas: 300000,
+                value: Wei::zero(),
+                message: AuctionMsg::Withdraw { to },
+            )
+        }
+        DoSettle { auction } -> Wei uses (mut call) {
+            call.call(
+                addr: auction,
+                gas: 300000,
+                value: Wei::zero(),
+                message: AuctionMsg::Settle {},
+            )
+        }
+    }
+}

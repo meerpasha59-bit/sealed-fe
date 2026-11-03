@@ -1,0 +1,172 @@
+// Randomised whole-auction checks. Each scenario draws bids, extra deposit
+// and who reveals from `std::evm::random`, runs a real auction on the test
+// EVM, and checks the invariants a second-price auction must keep:
+//
+//   1. the winner is the highest revealed bid (first revealer on ties);
+//   2. the price is max(second-highest revealed bid, reserve), or zero and no
+//      winner if the highest is below the reserve;
+//   3. every wei deposited is paid out exactly once (seller + bidders), and
+//      the contract ends with a zero balance.
+//
+// `KeccakRng` makes the scenarios reproducible from their seed, and
+// `ReplayRng` pins exact edge cases (all equal bids, nobody reveals).
+
+use ingot::AuctionMsg
+use ingot::tests::lifecycle::{
+    claimable_of,
+    commit_end,
+    deploy,
+    open,
+    place,
+    price_of,
+    pull,
+    reveal_end,
+    seller_pull,
+    settle_now,
+    warp,
+    winner_of,
+}
+use ingot::tests::harness::Bidder
+use std::evm::random::{KeccakRng, ReplayRng, Rng}
+use std::evm::gwei
+
+const N: usize = 5
+
+/// One drawn scenario.
+struct Draw { bids: [u256; N], extra: [u256; N], reveals: [bool; N], reserve: u256 }
+
+fn draw_scenario() -> Draw uses (rng: mut Rng) {
+    var bids: [u256; N] = [0; N]
+    var extra: [u256; N] = [0; N]
+    var reveals: [bool; N] = [false; N]
+    for i in 0 .. N {
+        // Small range on purpose so ties happen often.
+        bids[i] = rng.uniform(8) + 1
+        extra[i] = rng.uniform(4)
+        reveals[i] = rng.chance(numerator: 3, denominator: 4)
+    }
+    let reserve = rng.uniform(6)
+    Draw { bids, extra, reveals, reserve }
+}
+
+/// Run one auction for `d` and check every invariant. Amounts are in gwei.
+fn run_and_check(d: Draw, salt_base: u256) uses (evm: mut Evm) {
+    let reserve = gwei(d.reserve)
+    let auction = deploy(reserve, salt: salt_base + 99)
+    var bidders: [Address; N] = [Address::zero(); N]
+    var total: u256 = 0
+    for i in 0 .. N {
+        let who = evm.create2<Bidder>(value: Wei::zero(), args: (), salt: salt_base + i as u256)
+        bidders[i] = who
+        let deposit = d.bids[i] + d.extra[i]
+        total += deposit
+        place(
+            auction,
+            who,
+            amount: gwei(d.bids[i]),
+            salt: salt_base + i as u256,
+            deposit: gwei(deposit),
+        )
+    }
+    assert!(evm.balance(auction) == gwei(total))
+
+    // Reveal in index order and compute the expected outcome alongside.
+    warp(auction, to: commit_end())
+    var best: u256 = 0
+    var second: u256 = 0
+    var best_i: usize = N
+    for i in 0 .. N {
+        if d.reveals[i] {
+            open(
+                auction,
+                who: bidders[i],
+                amount: gwei(d.bids[i]),
+                salt: salt_base + i as u256,
+            )
+            if best_i == N || d.bids[i] > best {
+                second = best
+                best = d.bids[i]
+                best_i = i
+            } else if d.bids[i] > second {
+                second = d.bids[i]
+            }
+        }
+    }
+
+    warp(auction, to: reveal_end())
+    let price = settle_now(auction)
+    let sold = best_i != N && best >= d.reserve
+    if sold {
+        let expected = if second > d.reserve {
+            second
+        } else {
+            d.reserve
+        }
+        assert!(price == gwei(expected))
+        assert!(winner_of(auction) == bidders[best_i])
+    } else {
+        assert!(price == Wei::zero())
+        assert!(winner_of(auction) == Address::zero())
+    }
+    assert!(price_of(auction) == price)
+
+    // Pay everyone out and check conservation.
+    var paid: Wei = Wei::zero()
+    for i in 0 .. N {
+        let owed = claimable_of(auction, account: bidders[i])
+        if owed > Wei::zero() {
+            paid += pull(
+                auction,
+                who: bidders[i],
+                to: Address::new(0xfeed00 + salt_base + i as u256),
+            )
+        }
+    }
+    let seller_owed = claimable_of(auction, account: evm.address())
+    if seller_owed > Wei::zero() {
+        paid += seller_pull(auction, to: Address::new(0x5e1100 + salt_base))
+    }
+    assert!(paid == gwei(total))
+    assert!(evm.balance(auction) == Wei::zero())
+}
+
+#[test(balance = 100_000_000_000_000_000_000)]
+fn random_auctions_keep_invariants() uses (evm: mut Evm) {
+    var seed: u256 = 1
+    while seed <= 12 {
+        var rng = KeccakRng::seeded(seed)
+        let d = with (Rng = rng) {
+            draw_scenario()
+        }
+        run_and_check(d, salt_base: seed * 1000)
+        seed += 1
+    }
+}
+
+#[test(balance = 100_000_000_000_000_000_000)]
+fn replayed_all_equal_bids() uses (evm: mut Evm) {
+    // uniform(8) -> 3 for every bid (bid 4), no extra, everyone reveals
+    // (uniform(4) -> 0 < 3), reserve uniform(6) -> 6 % 6 = 0. (uniform(6)
+    // rejects words below 2^256 mod 6 = 4, so the reserve word must be >= 4.)
+    var rng = ReplayRng::new([3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 6])
+    let d = with (Rng = rng) {
+        draw_scenario()
+    }
+    assert!(d.bids[0] == 4 && d.bids[4] == 4)
+    assert!(d.reveals[0] && d.reveals[4])
+    run_and_check(d, salt_base: 50_000)
+}
+
+#[test(balance = 100_000_000_000_000_000_000)]
+fn replayed_nobody_reveals() uses (evm: mut Evm) {
+    // chance(3, 4) is uniform(4) < 3, so a reveal word of 3 means "no".
+    // Reserve word 8 gives 8 % 6 = 2.
+    var rng = ReplayRng::new([1, 2, 3, 5, 0, 3, 7, 1, 3, 2, 3, 3, 6, 0, 3, 8])
+    let d = with (Rng = rng) {
+        draw_scenario()
+    }
+    assert!(
+        !d.reveals[0] && !d.reveals[1] && !d.reveals[2] && !d.reveals[3] && !d.reveals[4],
+    )
+    run_and_check(d, salt_base: 60_000)
+}

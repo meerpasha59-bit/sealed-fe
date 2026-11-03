@@ -1,0 +1,342 @@
+// Pure unit tests: types, schedule, the second-price book and payouts.
+// No contract is deployed; these run as plain functions.
+
+use ingot::types::{Clock, Commitment, FixedClock, Phase, Schedule, current_phase}
+use ingot::book::{Book, bidder_payout, seller_payout}
+use std::evm::{days, ether, hours, seconds, wei}
+
+fn t(_ secs: u256) -> Timestamp {
+    Timestamp::from_seconds(secs)
+}
+
+fn schedule() -> Schedule {
+    // Starts at t=1000, commits for 1 day, reveals for 1 hour.
+    Schedule::starting(
+        at: t(1000),
+        commit_period: days(1),
+        reveal_period: hours(1),
+    )
+}
+
+// --- Schedule -----------------------------------------------------------------
+
+#[test]
+fn schedule_lays_out_windows() {
+    let s = schedule()
+    assert!(s.commit_end == t(1000 + 86_400))
+    assert!(s.reveal_end == t(1000 + 86_400 + 3_600))
+    assert!(s.reveal_end - s.commit_end == hours(1))
+}
+
+#[test]
+fn phase_boundaries_are_half_open() {
+    let s = schedule()
+    assert!(s.phase_at(t(0)).is(Phase::Commit))
+    assert!(s.phase_at(t(1000)).is(Phase::Commit))
+    assert!(s.phase_at(s.commit_end - seconds(1)).is(Phase::Commit))
+    assert!(s.phase_at(s.commit_end).is(Phase::Reveal))
+    assert!(s.phase_at(s.reveal_end - seconds(1)).is(Phase::Reveal))
+    assert!(s.phase_at(s.reveal_end).is(Phase::Closed))
+    assert!(s.phase_at(s.reveal_end + days(365)).is(Phase::Closed))
+}
+
+#[test]
+fn zero_length_windows_skip_phases() {
+    let no_commit = Schedule::starting(
+        at: t(50),
+        commit_period: Duration::zero(),
+        reveal_period: hours(1),
+    )
+    assert!(no_commit.phase_at(t(50)).is(Phase::Reveal))
+    let instant = Schedule::starting(
+        at: t(50),
+        commit_period: Duration::zero(),
+        reveal_period: Duration::zero(),
+    )
+    assert!(instant.phase_at(t(50)).is(Phase::Closed))
+}
+
+#[test]
+fn remaining_counts_down_each_window() {
+    let s = schedule()
+    assert!(s.remaining(t(1000)) == days(1))
+    assert!(s.remaining(s.commit_end) == hours(1))
+    assert!(s.remaining(s.reveal_end - seconds(10)) == seconds(10))
+    assert!(s.remaining(s.reveal_end) == Duration::zero())
+}
+
+#[test]
+fn phase_codes_are_stable() {
+    assert!(Phase::Commit.code() == 0)
+    assert!(Phase::Reveal.code() == 1)
+    assert!(Phase::Closed.code() == 2)
+    assert!(Phase::Settled.code() == 3)
+    assert!(!Phase::Commit.is(Phase::Reveal))
+}
+
+#[test]
+fn clock_effect_drives_current_phase() {
+    let s = schedule()
+    assert!(
+        with (Clock = FixedClock { at: t(1000) }) {
+            current_phase(schedule: s, settled: false)
+        }
+            .is(Phase::Commit),
+    )
+    assert!(
+        with (Clock = FixedClock { at: s.commit_end }) {
+            current_phase(schedule: s, settled: false)
+        }
+            .is(Phase::Reveal),
+    )
+    assert!(
+        with (Clock = FixedClock { at: s.reveal_end }) {
+            current_phase(schedule: s, settled: false)
+        }
+            .is(Phase::Closed),
+    )
+    // Settlement wins over the clock.
+    assert!(
+        with (Clock = FixedClock { at: t(0) }) {
+            current_phase(schedule: s, settled: true)
+        }
+            .is(Phase::Settled),
+    )
+}
+
+// --- Commitment ---------------------------------------------------------------
+
+#[test]
+fn commitment_matches_solidity_abi_encode() {
+    // keccak256(abi.encode(address(0x1111), address(0x2222), 1 ether, uint256(42)))
+    let c = Commitment::of(
+        auction: Address::new(0x1111),
+        bidder: Address::new(0x2222),
+        amount: ether(1),
+        salt: 42,
+    )
+    assert!(
+        c.0 == 0xfb9e37bd6026ac2aa4f61755213b93ad92f26adb17909513a5cac487df587ecf,
+    )
+}
+
+#[test]
+fn commitment_binds_every_input() {
+    let a = Address::new(0x1111)
+    let b = Address::new(0x2222)
+    let base = Commitment::of(auction: a, bidder: b, amount: ether(1), salt: 42)
+    assert!(
+        !base.matches(
+            Commitment::of(
+                auction: Address::new(0x1112),
+                bidder: b,
+                amount: ether(1),
+                salt: 42,
+            ),
+        ),
+    )
+    assert!(
+        !base.matches(
+            Commitment::of(
+                auction: a,
+                bidder: Address::new(0x2223),
+                amount: ether(1),
+                salt: 42,
+            ),
+        ),
+    )
+    assert!(
+        !base.matches(
+            Commitment::of(
+                auction: a,
+                bidder: b,
+                amount: ether(1) + wei(1),
+                salt: 42,
+            ),
+        ),
+    )
+    assert!(
+        !base.matches(
+            Commitment::of(auction: a, bidder: b, amount: ether(1), salt: 43),
+        ),
+    )
+    assert!(
+        base.matches(
+            Commitment::of(auction: a, bidder: b, amount: ether(1), salt: 42),
+        ),
+    )
+    assert!(!base.is_none())
+    assert!(Commitment::none().is_none())
+}
+
+// --- Book: the second-price rule -----------------------------------------------
+
+fn alice() -> Address {
+    Address::new(0xa11ce)
+}
+fn bob() -> Address {
+    Address::new(0xb0b)
+}
+fn carol() -> Address {
+    Address::new(0xca201)
+}
+
+#[test]
+fn empty_book_sells_nothing() {
+    let b = Book::empty()
+    assert!(!b.sold(reserve: Wei::zero()))
+    assert!(b.clearing_price(reserve: Wei::zero()) == Wei::zero())
+    assert!(b.reveals == 0)
+}
+
+#[test]
+fn single_bid_pays_the_reserve() {
+    let b = Book::empty().record(bidder: alice(), amount: ether(5))
+    assert!(b.winner == alice())
+    assert!(b.sold(reserve: ether(1)))
+    assert!(b.clearing_price(reserve: ether(1)) == ether(1))
+    // With no reserve a lone bidder gets it for free, as Vickrey prescribes.
+    assert!(b.clearing_price(reserve: Wei::zero()) == Wei::zero())
+}
+
+#[test]
+fn winner_pays_second_highest() {
+    let b = Book::empty()
+        .record(bidder: alice(), amount: ether(3))
+        .record(bidder: bob(), amount: ether(7))
+        .record(bidder: carol(), amount: ether(5))
+    assert!(b.winner == bob())
+    assert!(b.highest == ether(7))
+    assert!(b.second == ether(5))
+    assert!(b.reveals == 3)
+    assert!(b.clearing_price(reserve: ether(1)) == ether(5))
+}
+
+#[test]
+fn reveal_order_does_not_change_outcome() {
+    let x = Book::empty()
+        .record(bidder: alice(), amount: ether(3))
+        .record(bidder: bob(), amount: ether(7))
+        .record(bidder: carol(), amount: ether(5))
+    let y = Book::empty()
+        .record(bidder: carol(), amount: ether(5))
+        .record(bidder: alice(), amount: ether(3))
+        .record(bidder: bob(), amount: ether(7))
+    let z = Book::empty()
+        .record(bidder: bob(), amount: ether(7))
+        .record(bidder: carol(), amount: ether(5))
+        .record(bidder: alice(), amount: ether(3))
+    assert!(x.winner == y.winner && y.winner == z.winner)
+    assert!(
+        x.clearing_price(reserve: Wei::zero()) == y.clearing_price(reserve: Wei::zero()),
+    )
+    assert!(
+        y.clearing_price(reserve: Wei::zero()) == z.clearing_price(reserve: Wei::zero()),
+    )
+}
+
+#[test]
+fn tie_goes_to_first_revealer_at_their_own_bid() {
+    let b = Book::empty()
+        .record(bidder: alice(), amount: ether(4))
+        .record(bidder: bob(), amount: ether(4))
+    assert!(b.winner == alice())
+    assert!(b.clearing_price(reserve: Wei::zero()) == ether(4))
+}
+
+#[test]
+fn reserve_above_second_bid_sets_price() {
+    let b = Book::empty()
+        .record(bidder: alice(), amount: ether(10))
+        .record(bidder: bob(), amount: ether(2))
+    assert!(b.clearing_price(reserve: ether(6)) == ether(6))
+}
+
+#[test]
+fn bids_below_reserve_do_not_sell() {
+    let b = Book::empty()
+        .record(bidder: alice(), amount: ether(2))
+        .record(bidder: bob(), amount: ether(3))
+    assert!(!b.sold(reserve: ether(5)))
+    assert!(b.clearing_price(reserve: ether(5)) == Wei::zero())
+    // Exactly at the reserve sells, at the reserve.
+    assert!(b.sold(reserve: ether(3)))
+    assert!(b.clearing_price(reserve: ether(3)) == ether(3))
+}
+
+#[test]
+fn price_never_exceeds_winning_bid() {
+    let b = Book::empty()
+        .record(bidder: alice(), amount: wei(1))
+        .record(bidder: bob(), amount: wei(2))
+        .record(bidder: carol(), amount: wei(2))
+    assert!(b.winner == bob())
+    assert!(b.clearing_price(reserve: wei(1)) == wei(2))
+    assert!(b.clearing_price(reserve: wei(1)) <= b.highest)
+}
+
+// --- Payouts -------------------------------------------------------------------
+
+#[test]
+fn payouts_follow_the_rules() {
+    // Loser who revealed: full refund.
+    assert!(
+        bidder_payout(
+                deposit: ether(3),
+                revealed: true,
+                is_winner: false,
+                price: ether(2),
+            )
+            == ether(3),
+    )
+    // Winner: deposit minus price.
+    assert!(
+        bidder_payout(
+                deposit: ether(9),
+                revealed: true,
+                is_winner: true,
+                price: ether(2),
+            )
+            == ether(7),
+    )
+    // Never revealed: forfeits everything.
+    assert!(
+        bidder_payout(
+                deposit: ether(9),
+                revealed: false,
+                is_winner: false,
+                price: ether(2),
+            )
+            == Wei::zero(),
+    )
+    // Seller: price plus forfeits.
+    assert!(
+        seller_payout(
+                price: ether(2),
+                total_deposits: ether(21),
+                revealed_deposits: ether(12),
+            )
+            == ether(11),
+    )
+}
+
+#[test]
+fn payouts_conserve_deposits() {
+    // alice 3 (reveals 3), bob 9 (reveals 7, wins), carol 9 (never reveals)
+    let book = Book::empty()
+        .record(bidder: alice(), amount: ether(3))
+        .record(bidder: bob(), amount: ether(7))
+    let price = book.clearing_price(reserve: ether(1))
+    assert!(price == ether(3))
+    let total = ether(3) + ether(9) + ether(9)
+    let paid = bidder_payout(deposit: ether(3), revealed: true, is_winner: false, price)
+        + bidder_payout(deposit: ether(9), revealed: true, is_winner: true, price)
+        + bidder_payout(
+            deposit: ether(9),
+            revealed: false,
+            is_winner: false,
+            price,
+        )
+        + seller_payout(price, total_deposits: total, revealed_deposits: ether(12))
+    assert!(paid == total)
+}

@@ -1,0 +1,230 @@
+// Tests against the real `SealedAuction` contract, which reads the block
+// clock. The test EVM's clock doesn't move inside a test, so each test picks
+// periods that put the fresh auction in the phase it wants to check.
+
+use ingot::{AuctionMsg, SealedAuction}
+use ingot::types::Commitment
+use ingot::tests::harness::{Bidder, BidderMsg}
+use std::evm::{days, ether, hours}
+
+fn deploy_live(commit_period: Duration, reveal_period: Duration, reserve: Wei) -> Address
+uses (evm: mut Evm)
+{
+    evm.create2<SealedAuction>(
+        value: Wei::zero(),
+        args: (commit_period, reveal_period, reserve),
+        salt: 7,
+    )
+}
+
+fn live_phase(_ auction: Address) -> u8 uses (evm: mut Evm) {
+    evm.call(
+        addr: auction,
+        gas: 100000,
+        value: Wei::zero(),
+        message: AuctionMsg::Phase {},
+    )
+}
+
+#[test]
+fn constructor_records_schedule_seller_and_reserve() uses (evm: mut Evm) {
+    let auction = deploy_live(
+        commit_period: days(2),
+        reveal_period: hours(6),
+        reserve: ether(3),
+    )
+    let commit_end: Timestamp = evm
+        .call(
+            addr: auction,
+            gas: 100000,
+            value: Wei::zero(),
+            message: AuctionMsg::CommitEnd {},
+        )
+    let reveal_end: Timestamp = evm
+        .call(
+            addr: auction,
+            gas: 100000,
+            value: Wei::zero(),
+            message: AuctionMsg::RevealEnd {},
+        )
+    let seller: Address = evm
+        .call(
+            addr: auction,
+            gas: 100000,
+            value: Wei::zero(),
+            message: AuctionMsg::Seller {},
+        )
+    let reserve: Wei = evm
+        .call(
+            addr: auction,
+            gas: 100000,
+            value: Wei::zero(),
+            message: AuctionMsg::Reserve {},
+        )
+    assert!(commit_end == evm.timestamp() + days(2))
+    assert!(reveal_end - commit_end == hours(6))
+    assert!(seller == evm.address())
+    assert!(reserve == ether(3))
+    assert!(live_phase(auction) == 0)
+}
+
+#[test(balance = 100_000_000_000_000_000_000)]
+fn live_commit_stores_commitment_and_deposit() uses (evm: mut Evm) {
+    let auction = deploy_live(
+        commit_period: days(1),
+        reveal_period: hours(1),
+        reserve: Wei::zero(),
+    )
+    let a = evm.create2<Bidder>(value: Wei::zero(), args: (), salt: 1)
+    let c = Commitment::of(auction, bidder: a, amount: ether(2), salt: 99)
+    evm.call(
+        addr: a,
+        gas: 500000,
+        value: ether(5),
+        message: BidderMsg::DoCommit { auction, commitment: c.0 },
+    )
+    let stored: u256 = evm
+        .call(
+            addr: auction,
+            gas: 100000,
+            value: Wei::zero(),
+            message: AuctionMsg::CommitmentOf { bidder: a },
+        )
+    let deposit: Wei = evm
+        .call(
+            addr: auction,
+            gas: 100000,
+            value: Wei::zero(),
+            message: AuctionMsg::DepositOf { bidder: a },
+        )
+    let bidders: u256 = evm
+        .call(
+            addr: auction,
+            gas: 100000,
+            value: Wei::zero(),
+            message: AuctionMsg::Bidders {},
+        )
+    assert!(stored == c.0)
+    assert!(deposit == ether(5))
+    assert!(bidders == 1)
+    assert!(evm.balance(auction) == ether(5))
+    // The bid amount is not visible anywhere on chain yet.
+    let highest: Wei = evm
+        .call(
+            addr: auction,
+            gas: 100000,
+            value: Wei::zero(),
+            message: AuctionMsg::HighestBid {},
+        )
+    assert!(highest == Wei::zero())
+}
+
+// WrongPhase(uint8,uint8) = 0x05fb5e1b
+#[test(should_revert, selector = 0x05fb5e1b, balance = 100_000_000_000_000_000_000)]
+fn live_reveal_during_commit_reverts() uses (evm: mut Evm) {
+    let auction = deploy_live(
+        commit_period: days(1),
+        reveal_period: hours(1),
+        reserve: Wei::zero(),
+    )
+    let a = evm.create2<Bidder>(value: Wei::zero(), args: (), salt: 1)
+    let c = Commitment::of(auction, bidder: a, amount: ether(2), salt: 99)
+    evm.call(
+        addr: a,
+        gas: 500000,
+        value: ether(5),
+        message: BidderMsg::DoCommit { auction, commitment: c.0 },
+    )
+    let _: bool = evm
+        .call(
+            addr: a,
+            gas: 500000,
+            value: Wei::zero(),
+            message: BidderMsg::DoReveal { auction, amount: ether(2), salt: 99 },
+        )
+}
+
+#[test(should_revert, selector = 0x05fb5e1b)]
+fn live_settle_during_commit_reverts() uses (evm: mut Evm) {
+    let auction = deploy_live(
+        commit_period: days(1),
+        reveal_period: hours(1),
+        reserve: Wei::zero(),
+    )
+    let _: Wei = evm
+        .call(
+            addr: auction,
+            gas: 300000,
+            value: Wei::zero(),
+            message: AuctionMsg::Settle {},
+        )
+}
+
+#[test(should_revert, selector = 0x05fb5e1b, balance = 100_000_000_000_000_000_000)]
+fn live_commit_in_reveal_window_reverts() uses (evm: mut Evm) {
+    // A zero-length commit period opens straight into the reveal window.
+    let auction = deploy_live(
+        commit_period: Duration::zero(),
+        reveal_period: hours(1),
+        reserve: Wei::zero(),
+    )
+    assert!(live_phase(auction) == 1)
+    let a = evm.create2<Bidder>(value: Wei::zero(), args: (), salt: 1)
+    evm.call(
+        addr: a,
+        gas: 500000,
+        value: ether(1),
+        message: BidderMsg::DoCommit { auction, commitment: 1 },
+    )
+}
+
+#[test]
+fn live_empty_auction_settles() uses (evm: mut Evm) {
+    let auction = deploy_live(
+        commit_period: Duration::zero(),
+        reveal_period: Duration::zero(),
+        reserve: ether(1),
+    )
+    assert!(live_phase(auction) == 2)
+    let price: Wei = evm
+        .call(
+            addr: auction,
+            gas: 300000,
+            value: Wei::zero(),
+            message: AuctionMsg::Settle {},
+        )
+    assert!(price == Wei::zero())
+    assert!(live_phase(auction) == 3)
+    let winner: Address = evm
+        .call(
+            addr: auction,
+            gas: 100000,
+            value: Wei::zero(),
+            message: AuctionMsg::Winner {},
+        )
+    assert!(winner == Address::zero())
+}
+
+// NothingToWithdraw() = 0xd0d04f60
+#[test(should_revert, selector = 0xd0d04f60)]
+fn live_seller_with_no_sale_has_nothing_to_withdraw() uses (evm: mut Evm) {
+    let auction = deploy_live(
+        commit_period: Duration::zero(),
+        reveal_period: Duration::zero(),
+        reserve: Wei::zero(),
+    )
+    let _: Wei = evm
+        .call(
+            addr: auction,
+            gas: 300000,
+            value: Wei::zero(),
+            message: AuctionMsg::Settle {},
+        )
+    let _: Wei = evm
+        .call(
+            addr: auction,
+            gas: 300000,
+            value: Wei::zero(),
+            message: AuctionMsg::Withdraw { to: Address::new(0x5e11) },
+        )
+}
