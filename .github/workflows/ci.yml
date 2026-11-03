@@ -26,3 +26,24 @@ jobs:
       - run: fe build
       - name: Classic auction bugs must not compile
         run: ./scripts/compile-fail.sh
+
+  gas:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Fe
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh | bash -s -- --version "$FE_VERSION" --no-modify-path
+          echo "$HOME/.fe/bin" >> "$GITHUB_PATH"
+      - name: Install solc 0.8.28
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/solc" https://github.com/ethereum/solidity/releases/download/v0.8.28/solc-static-linux
+          chmod +x "$HOME/bin/solc"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r bench/requirements.txt
+      - name: Fe vs Solidity gas, same auction
+        run: python3 bench/gas.py --md | tee -a "$GITHUB_STEP_SUMMARY"
