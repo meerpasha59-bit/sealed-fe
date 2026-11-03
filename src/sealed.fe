@@ -1,0 +1,195 @@
+// The deployable contract: a thin shell that decodes calls, provides the
+// block's clock, emits events and moves ETH. All the rules live in
+// `auction.fe`.
+
+use ingot::types::{Clock, Commitment, FixedClock, Schedule, current_phase}
+use ingot::auction::{AuctionStore, claimable, commit, reveal, settle, setup, take_payout}
+
+pub msg AuctionMsg {
+    #[selector = sol("commit(uint256)")]
+    Commit { commitment: u256 },
+    #[selector = sol("reveal(uint256,uint256)")]
+    Reveal { amount: Wei, salt: u256 } -> bool,
+    #[selector = sol("settle()")]
+    Settle -> Wei,
+    #[selector = sol("withdraw(address)")]
+    Withdraw { to: Address } -> Wei,
+    #[selector = sol("phase()")]
+    Phase -> u8,
+    #[selector = sol("winner()")]
+    Winner -> Address,
+    #[selector = sol("price()")]
+    Price -> Wei,
+    #[selector = sol("highestBid()")]
+    HighestBid -> Wei,
+    #[selector = sol("claimable(address)")]
+    Claimable { account: Address } -> Wei,
+    #[selector = sol("commitmentOf(address)")]
+    CommitmentOf { bidder: Address } -> u256,
+    #[selector = sol("depositOf(address)")]
+    DepositOf { bidder: Address } -> Wei,
+    #[selector = sol("bidders()")]
+    Bidders -> u256,
+    #[selector = sol("reveals()")]
+    Reveals -> u256,
+    #[selector = sol("commitEnd()")]
+    CommitEnd -> Timestamp,
+    #[selector = sol("revealEnd()")]
+    RevealEnd -> Timestamp,
+    #[selector = sol("seller()")]
+    Seller -> Address,
+    #[selector = sol("reserve()")]
+    Reserve -> Wei,
+}
+
+#[event]
+pub struct Committed {
+    #[indexed]
+    pub bidder: Address,
+    pub commitment: u256,
+    pub deposit: Wei,
+}
+
+#[event]
+pub struct Revealed {
+    #[indexed]
+    pub bidder: Address,
+    pub amount: Wei,
+    pub leading: bool,
+}
+
+#[event]
+pub struct Settled {
+    #[indexed]
+    pub winner: Address,
+    pub price: Wei,
+    pub bidders: u256,
+    pub reveals: u256,
+}
+
+#[event]
+pub struct Withdrawn {
+    #[indexed]
+    pub account: Address,
+    pub to: Address,
+    pub amount: Wei,
+}
+
+/// A sealed-bid, second-price (Vickrey) auction for one item.
+///
+/// Deployed by the seller with a commit period, a reveal period and a reserve
+/// price. Bidders commit `keccak256(abi.encode(auction, bidder, amount, salt))`
+/// with a deposit of at least `amount`, reveal `(amount, salt)` in the reveal
+/// window, and after anyone calls `settle()` everyone pulls their payout with
+/// `withdraw(to)`. The highest bidder wins and pays the second-highest bid (or
+/// the reserve, if higher).
+pub contract SealedAuction uses (ctx: Ctx, call: mut Call, log: mut Log) {
+    mut store: AuctionStore,
+
+    init(commit_period: Duration, reveal_period: Duration, reserve: Wei)
+    uses (ctx, mut store)
+    {
+        let schedule = Schedule::starting(at: ctx.timestamp(), commit_period, reveal_period)
+        with (store) {
+            setup(seller: ctx.caller(), schedule, reserve)
+        }
+    }
+
+    recv AuctionMsg {
+        #[payable]
+        Commit { commitment } uses (ctx, mut store, mut log) {
+            let bidder = ctx.caller()
+            let deposit = ctx.value()
+            with (Clock = FixedClock { at: ctx.timestamp() }, store) {
+                commit(bidder, commitment: Commitment(commitment), deposit)
+            }
+            log.emit(Committed { bidder, commitment, deposit })
+        }
+
+        Reveal { amount, salt } -> bool uses (ctx, mut store, mut log) {
+            let bidder = ctx.caller()
+            let leading = with (Clock = FixedClock { at: ctx.timestamp() }, store) {
+                reveal(auction: ctx.address(), bidder, amount, salt)
+            }
+            log.emit(Revealed { bidder, amount, leading })
+            leading
+        }
+
+        Settle -> Wei uses (ctx, mut store, mut log) {
+            let price = with (Clock = FixedClock { at: ctx.timestamp() }, store) {
+                settle()
+            }
+            let winner = if price == Wei::zero() {
+                Address::zero()
+            } else {
+                store.book.winner
+            }
+            log.emit(
+                Settled { winner, price, bidders: store.bidders, reveals: store.book.reveals },
+            )
+            price
+        }
+
+        Withdraw { to } -> Wei uses (ctx, mut call, mut store, mut log) {
+            let account = ctx.caller()
+            let amount = with (Clock = FixedClock { at: ctx.timestamp() }, store) {
+                take_payout(account)
+            }
+            assert!(
+                call.send_value(addr: to, gas: 0, value: amount).success(),
+                "Transfer failed",
+            )
+            log.emit(Withdrawn { account, to, amount })
+            amount
+        }
+
+        Phase -> u8 uses (ctx, store) {
+            with (Clock = FixedClock { at: ctx.timestamp() }) {
+                current_phase(schedule: store.schedule, settled: store.settled).code()
+            }
+        }
+
+        Winner -> Address uses (store) {
+            if store.settled && store.price == Wei::zero() {
+                Address::zero()
+            } else {
+                store.book.winner
+            }
+        }
+        Price -> Wei uses (store) {
+            store.price
+        }
+        HighestBid -> Wei uses (store) {
+            store.book.highest
+        }
+        Claimable { account } -> Wei uses (store) {
+            with (store) {
+                claimable(account)
+            }
+        }
+        CommitmentOf { bidder } -> u256 uses (store) {
+            store.commitments.get(key: bidder).0
+        }
+        DepositOf { bidder } -> Wei uses (store) {
+            store.deposits.get(key: bidder)
+        }
+        Bidders -> u256 uses (store) {
+            store.bidders
+        }
+        Reveals -> u256 uses (store) {
+            store.book.reveals
+        }
+        CommitEnd -> Timestamp uses (store) {
+            store.schedule.commit_end
+        }
+        RevealEnd -> Timestamp uses (store) {
+            store.schedule.reveal_end
+        }
+        Seller -> Address uses (store) {
+            store.seller
+        }
+        Reserve -> Wei uses (store) {
+            store.reserve
+        }
+    }
+}

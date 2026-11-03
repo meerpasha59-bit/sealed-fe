@@ -1,0 +1,186 @@
+// Auction state transitions, written once against two effects: a `Clock`
+// and the auction's storage. The deployed contract (`sealed.fe`) provides the
+// block's clock; the test harness provides a clock it can move. Both run the
+// very same functions below.
+
+use std::evm::{StorageMap, revert_error}
+use ingot::types::{Clock, Commitment, Phase, Schedule, current_phase}
+use ingot::book::{Book, bidder_payout, seller_payout}
+
+// -----------------------------------------------------------------------------
+// Errors (Solidity-compatible custom errors)
+// -----------------------------------------------------------------------------
+
+/// The call is not allowed in the auction's current phase.
+#[error]
+pub struct WrongPhase { pub expected: u8, pub actual: u8 }
+
+/// The account already committed a bid in this auction.
+#[error]
+pub struct AlreadyCommitted { pub bidder: Address }
+
+/// A commit carried no deposit or an empty commitment.
+#[error]
+pub struct EmptyCommit {}
+
+/// The seller can't bid in their own auction.
+#[error]
+pub struct SellerCannotBid {}
+
+/// A reveal from an account with no commitment.
+#[error]
+pub struct NoCommitment { pub bidder: Address }
+
+/// The revealed bid and salt don't hash to the stored commitment.
+#[error]
+pub struct CommitmentMismatch {}
+
+/// The account already revealed.
+#[error]
+pub struct AlreadyRevealed {}
+
+/// The revealed bid is larger than the deposit sent with the commitment, or
+/// is zero.
+#[error]
+pub struct InvalidBid { pub amount: Wei, pub deposit: Wei }
+
+/// The account has nothing (left) to withdraw.
+#[error]
+pub struct NothingToWithdraw {}
+
+// -----------------------------------------------------------------------------
+// Storage
+// -----------------------------------------------------------------------------
+
+/// Everything the auction keeps in storage.
+pub struct AuctionStore {
+    pub seller: Address,
+    pub schedule: Schedule,
+    pub reserve: Wei,
+    pub settled: bool,
+    pub book: Book,
+    pub price: Wei,
+    pub bidders: u256,
+    pub total_deposits: Wei,
+    pub revealed_deposits: Wei,
+    pub commitments: StorageMap<Address, Commitment>,
+    pub deposits: StorageMap<Address, Wei>,
+    pub revealed: StorageMap<Address, bool>,
+    pub withdrawn: StorageMap<Address, bool>,
+}
+
+// -----------------------------------------------------------------------------
+// Transitions
+// -----------------------------------------------------------------------------
+
+/// Revert unless the auction is in `expected` right now.
+pub fn require_phase(_ expected: Phase) uses (clock: Clock, store: AuctionStore) {
+    let actual = current_phase(schedule: store.schedule, settled: store.settled)
+    if !actual.is(expected) {
+        revert_error(
+            WrongPhase { expected: expected.code(), actual: actual.code() },
+        )
+    }
+}
+
+pub fn setup(seller: Address, schedule: Schedule, reserve: Wei)
+uses (store: mut AuctionStore)
+{
+    store.seller = seller
+    store.schedule = schedule
+    store.reserve = reserve
+    store.book = Book::empty()
+}
+
+/// Lock a sealed bid. `deposit` may exceed the bid to hide its size; the
+/// excess comes back at withdrawal.
+pub fn commit(bidder: Address, commitment: Commitment, deposit: Wei)
+uses (clock: Clock, store: mut AuctionStore)
+{
+    require_phase(Phase::Commit)
+    if bidder == store.seller {
+        revert_error(SellerCannotBid {})
+    }
+    if deposit == Wei::zero() || commitment.is_none() {
+        revert_error(EmptyCommit {})
+    }
+    if !store.commitments.get(key: bidder).is_none() {
+        revert_error(AlreadyCommitted { bidder })
+    }
+    store.commitments.set(key: bidder, value: commitment)
+    store.deposits.set(key: bidder, value: deposit)
+    store.bidders += 1
+    store.total_deposits += deposit
+}
+
+/// Open a sealed bid. Returns the bidder's standing: `true` if they lead.
+pub fn reveal(auction: Address, bidder: Address, amount: Wei, salt: u256) -> bool
+uses (clock: Clock, store: mut AuctionStore)
+{
+    require_phase(Phase::Reveal)
+    let stored = store.commitments.get(key: bidder)
+    if stored.is_none() {
+        revert_error(NoCommitment { bidder })
+    }
+    if store.revealed.get(key: bidder) {
+        revert_error(AlreadyRevealed {})
+    }
+    if !stored.matches(Commitment::of(auction, bidder, amount, salt)) {
+        revert_error(CommitmentMismatch {})
+    }
+    let deposit = store.deposits.get(key: bidder)
+    if amount == Wei::zero() || amount > deposit {
+        revert_error(InvalidBid { amount, deposit })
+    }
+    store.revealed.set(key: bidder, value: true)
+    store.revealed_deposits += deposit
+    store.book = store.book.record(bidder, amount)
+    store.book.winner == bidder
+}
+
+/// Fix the outcome. Anyone may call it once the reveal window is over.
+/// Returns the clearing price (zero if the item did not sell).
+pub fn settle() -> Wei uses (clock: Clock, store: mut AuctionStore) {
+    require_phase(Phase::Closed)
+    let price = store.book.clearing_price(reserve: store.reserve)
+    store.price = price
+    store.settled = true
+    price
+}
+
+/// What `account` may withdraw now (zero before settlement or after
+/// withdrawing).
+pub fn claimable(_ account: Address) -> Wei uses (store: AuctionStore) {
+    if !store.settled || store.withdrawn.get(key: account) {
+        return Wei::zero()
+    }
+    if account == store.seller {
+        return seller_payout(
+            price: store.price,
+            total_deposits: store.total_deposits,
+            revealed_deposits: store.revealed_deposits,
+        )
+    }
+    let sold = store.book.sold(reserve: store.reserve)
+    bidder_payout(
+        deposit: store.deposits.get(key: account),
+        revealed: store.revealed.get(key: account),
+        is_winner: sold && store.book.winner == account,
+        price: store.price,
+    )
+}
+
+/// Mark `account`'s payout as taken and return it. The caller sends the ETH
+/// *after* this returns, so a reentrant call finds nothing left (checks,
+/// effects, interactions).
+pub fn take_payout(_ account: Address) -> Wei
+uses (clock: Clock, store: mut AuctionStore)
+{
+    require_phase(Phase::Settled)
+    let amount = claimable(account)
+    if amount == Wei::zero() {
+        revert_error(NothingToWithdraw {})
+    }
+    store.withdrawn.set(key: account, value: true)
+    amount
+}
