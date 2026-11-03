@@ -242,17 +242,23 @@ gap:
 ## Demo
 
 Reproducible CLI demo, narrated from Fe's own `--call-trace` of the
-three-bidder test:
+three-bidder test (screenshots: [docs/demo.png](docs/demo.png) and
+[docs/tests.png](docs/tests.png), the latter showing `fe test`, a
+compile error and the compile-fail check):
+
+![Narrated auction](docs/demo.png)
 
 ```text
 $ python3 scripts/demo.py
+Sealed: a sealed-bid second-price auction, narrated from `fe test --call-trace`
+
 Setup: seller deploys with reserve 1 ETH, commit window 1 day, reveal window 1 hour.
 Bids (secret until reveal): alice 3 ETH, bob 7 ETH (deposits 10 to hide it), carol 5 ETH.
 
   [phase]   auction is in Commit
-  [commit]  alice  publishes commitment 0x08244a44d4257bf2… with a deposit
-  [commit]  bob    publishes commitment 0xa97b639d7b88170a… with a deposit
-  [commit]  carol  publishes commitment 0xc674fdf06e703703… with a deposit
+  [commit]  alice  publishes commitment 0x8052e27ee5779686… with a deposit
+  [commit]  bob    publishes commitment 0x40d057869967eb4f… with a deposit
+  [commit]  carol  publishes commitment 0xd9a87bb277459e19… with a deposit
   [state]   3 sealed bids locked, amounts still hidden
   [clock]   time moves to t=1086400
   [phase]   auction is in Reveal
