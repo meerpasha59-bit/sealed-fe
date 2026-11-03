@@ -308,6 +308,34 @@ fn single_bidder_pays_reserve() uses (evm: mut Evm) {
 }
 
 #[test(balance = 100_000_000_000_000_000_000)]
+fn lone_bidder_without_reserve_wins_for_free() uses (evm: mut Evm) {
+    // Second-price with one bid and no reserve: the bidder wins and pays 0.
+    // The winner must still be reported, even though the price is zero.
+    let auction = deploy(reserve: Wei::zero(), salt: 0)
+    let a = bidder(1)
+    place(
+        auction,
+        who: a,
+        amount: ether(8),
+        salt: SALT_A,
+        deposit: ether(8),
+    )
+    warp(auction, to: commit_end())
+    open(auction, who: a, amount: ether(8), salt: SALT_A)
+    warp(auction, to: reveal_end())
+    assert!(settle_now(auction) == Wei::zero())
+    assert!(winner_of(auction) == a)
+    assert!(phase(auction) == 3)
+    assert!(
+        claimable_of(auction, account: evm.address()) == Wei::zero(),
+    )
+    assert!(
+        pull(auction, who: a, to: Address::new(0xaaa1)) == ether(8),
+    )
+    assert!(evm.balance(auction) == Wei::zero())
+}
+
+#[test(balance = 100_000_000_000_000_000_000)]
 fn equal_bids_first_revealer_wins_at_that_price() uses (evm: mut Evm) {
     let auction = deploy(reserve: Wei::zero(), salt: 0)
     let a = bidder(1)

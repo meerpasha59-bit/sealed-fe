@@ -1,7 +1,7 @@
 // Pure unit tests: types, schedule, the second-price book and payouts.
 // No contract is deployed; these run as plain functions.
 
-use ingot::types::{Clock, Commitment, FixedClock, Phase, Schedule, current_phase}
+use ingot::types::{Clock, Commitment, FixedClock, Phase, Schedule, Settlement, current_phase}
 use ingot::book::{Book, bidder_payout, seller_payout}
 use std::evm::{days, ether, hours, seconds, wei}
 
@@ -339,4 +339,19 @@ fn payouts_conserve_deposits() {
         )
         + seller_payout(price, total_deposits: total, revealed_deposits: ether(12))
     assert!(paid == total)
+}
+
+// --- Settlement encoding ------------------------------------------------------
+
+#[test]
+fn settlement_packs_flag_and_price_in_one_word() {
+    let pending = Settlement::pending()
+    assert!(!pending.is_settled())
+    assert!(pending.price() == Wei::zero())
+    let free = Settlement::at(Wei::zero())
+    assert!(free.is_settled())
+    assert!(free.price() == Wei::zero())
+    let sold = Settlement::at(ether(5))
+    assert!(sold.is_settled())
+    assert!(sold.price() == ether(5))
 }
