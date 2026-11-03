@@ -1,0 +1,6 @@
+[ingot]
+name = "read_only_store_cannot_settle"
+version = "0.1.0"
+
+[dependencies]
+sealed = "../.."

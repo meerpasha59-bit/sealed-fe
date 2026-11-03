@@ -1,0 +1,6 @@
+[ingot]
+name = "money_plus_time"
+version = "0.1.0"
+
+[dependencies]
+sealed = "../.."

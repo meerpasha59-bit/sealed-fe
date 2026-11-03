@@ -1,0 +1,11 @@
+// A match over Phase that forgets a phase is rejected.
+// expect: non-exhaustive patterns: type `Phase` is not covered
+use sealed::types::Phase
+
+pub fn can_withdraw(p: Phase) -> bool {
+    match p {
+        Phase::Commit => false,
+        Phase::Reveal => false,
+        Phase::Closed => false,
+    }
+}

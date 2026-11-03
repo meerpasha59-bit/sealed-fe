@@ -1,0 +1,5 @@
+// A reserve price plus a reveal period mixes money with time.
+// expect: expected `Wei`, but `Duration` is given
+pub fn broken(reserve: Wei, reveal_period: Duration) -> Wei {
+    reserve + reveal_period
+}

@@ -1,0 +1,7 @@
+// Adding two points in time is meaningless, so it does not compile.
+// expect: expected `Duration`, but `Timestamp` is given
+use sealed::types::Schedule
+
+pub fn broken(s: Schedule) -> Timestamp {
+    s.commit_end + s.reveal_end
+}

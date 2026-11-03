@@ -1,0 +1,8 @@
+// A view that only reads the auction can't call a transition that writes it.
+// expect: `settle` requires `mut AuctionStore`
+use sealed::auction::{AuctionStore, settle}
+use sealed::types::Clock
+
+pub fn peek_price() -> Wei uses (clock: Clock, store: AuctionStore) {
+    settle()
+}

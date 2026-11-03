@@ -1,0 +1,6 @@
+[ingot]
+name = "phase_needs_a_clock"
+version = "0.1.0"
+
+[dependencies]
+sealed = "../.."

@@ -24,3 +24,5 @@ jobs:
       - run: fe fmt --check
       - run: fe test
       - run: fe build
+      - name: Classic auction bugs must not compile
+        run: ./scripts/compile-fail.sh

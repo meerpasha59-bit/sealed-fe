@@ -1,0 +1,8 @@
+// A bare word can't be passed where a Commitment is expected: it must be
+// built with `Commitment::of(auction, bidder, amount, salt)`.
+// expect: expected `Commitment`, but `u256` is given
+use sealed::types::Commitment
+
+pub fn broken(stored: Commitment, guess: u256) -> bool {
+    stored.matches(guess)
+}

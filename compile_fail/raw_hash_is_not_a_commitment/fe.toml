@@ -1,0 +1,6 @@
+[ingot]
+name = "raw_hash_is_not_a_commitment"
+version = "0.1.0"
+
+[dependencies]
+sealed = "../.."

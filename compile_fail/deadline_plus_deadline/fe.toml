@@ -1,0 +1,6 @@
+[ingot]
+name = "deadline_plus_deadline"
+version = "0.1.0"
+
+[dependencies]
+sealed = "../.."

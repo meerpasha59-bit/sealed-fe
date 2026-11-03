@@ -1,0 +1,8 @@
+// Reading the phase needs a Clock; code that forgets to say where "now"
+// comes from does not compile.
+// expect: missing effect `Clock`
+use sealed::types::{Phase, Schedule, current_phase}
+
+pub fn broken(s: Schedule) -> Phase {
+    current_phase(schedule: s, settled: false)
+}
