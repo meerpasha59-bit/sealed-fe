@@ -1,0 +1,84 @@
+// The second-price rule as a pure value: no storage, no clock, no EVM.
+//
+// A `Book` tracks the highest and second-highest revealed bids. Reveals can
+// arrive in any order; the book only ever needs these two numbers, so
+// settlement costs the same whether 2 or 2,000 bidders revealed.
+
+/// The running state of revealed bids.
+pub struct Book { pub winner: Address, pub highest: Wei, pub second: Wei, pub reveals: u256 }
+
+impl Copy for Book {}
+
+impl Book {
+    pub fn empty() -> Self {
+        Book { winner: Address::zero(), highest: Wei::zero(), second: Wei::zero(), reveals: 0 }
+    }
+
+    /// Fold one revealed bid into the book.
+    ///
+    /// Ties go to the earlier reveal: a later equal bid becomes the second
+    /// price instead, so the winner of a tie pays their own bid, which is what
+    /// a second-price auction prescribes.
+    pub fn record(self, bidder: Address, amount: Wei) -> Book {
+        if self.reveals == 0 || amount > self.highest {
+            Book {
+                winner: bidder,
+                highest: amount,
+                second: self.highest,
+                reveals: self.reveals + 1,
+            }
+        } else if amount > self.second {
+            Book {
+                winner: self.winner,
+                highest: self.highest,
+                second: amount,
+                reveals: self.reveals + 1,
+            }
+        } else {
+            Book {
+                winner: self.winner,
+                highest: self.highest,
+                second: self.second,
+                reveals: self.reveals + 1,
+            }
+        }
+    }
+
+    /// Whether the item sells: at least one reveal at or above the reserve.
+    pub fn sold(self, reserve: Wei) -> bool {
+        self.reveals > 0 && self.highest >= reserve
+    }
+
+    /// What the winner pays: the second-highest bid, but never less than the
+    /// reserve. Zero when the item does not sell.
+    pub fn clearing_price(self, reserve: Wei) -> Wei {
+        if !self.sold(reserve) {
+            Wei::zero()
+        } else if self.second > reserve {
+            self.second
+        } else {
+            reserve
+        }
+    }
+}
+
+/// What a single account may withdraw once the auction is settled.
+///
+/// * A bidder who revealed gets their whole deposit back, minus the price if
+///   they won.
+/// * A bidder who committed but never revealed forfeits the deposit to the
+///   seller. Without this penalty a bidder could commit many bids and reveal
+///   only the one that suits them after seeing others' reveals.
+/// * The seller gets the price plus all forfeited deposits.
+///
+/// Each wei deposited ends up with exactly one account, so the payouts
+/// always add up to the deposits (see `tests/properties.fe`).
+pub fn bidder_payout(deposit: Wei, revealed: bool, is_winner: bool, price: Wei) -> Wei {
+    if !revealed {
+        Wei::zero()
+    } else if is_winner { deposit - price } else { deposit }
+}
+
+pub fn seller_payout(price: Wei, total_deposits: Wei, revealed_deposits: Wei) -> Wei {
+    price + (total_deposits - revealed_deposits)
+}

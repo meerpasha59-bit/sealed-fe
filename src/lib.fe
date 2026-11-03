@@ -1,82 +1,8 @@
-// A time-locked vault: each account deposits ETH and can withdraw it once its
-// lock period has passed. Replace it with your own project.
+// Sealed: a sealed-bid second-price (Vickrey) auction in Fe.
+//
+// * `types`   — Commitment, Phase, Schedule and the Clock effect
+// * `book`    — the second-price rule and payouts as pure values
+// * `auction` — state transitions over the Clock and storage effects
+// * `sealed`  — the deployable SealedAuction contract
 
-use std::evm::StorageMap
-
-msg VaultMsg {
-    #[selector = sol("deposit()")]
-    Deposit -> Timestamp,
-    #[selector = sol("withdraw(address)")]
-    Withdraw { to: Address } -> Wei,
-    #[selector = sol("balanceOf(address)")]
-    BalanceOf { owner: Address } -> Wei,
-    #[selector = sol("unlockTime(address)")]
-    UnlockTime { owner: Address } -> Timestamp,
-}
-
-#[event]
-struct Deposited {
-    #[indexed]
-    owner: Address,
-    amount: Wei,
-    unlock_at: Timestamp,
-}
-
-#[event]
-struct Withdrawn {
-    #[indexed]
-    owner: Address,
-    to: Address,
-    amount: Wei,
-}
-
-pub contract Vault uses (ctx: Ctx, call: mut Call, log: mut Log) {
-    lock: Duration,
-    mut balances: StorageMap<Address, Wei>,
-    mut unlock_at: StorageMap<Address, Timestamp>,
-
-    init(lock_period: Duration) uses (mut lock) { lock = lock_period }
-
-    recv VaultMsg {
-        // Every deposit restarts the depositor's lock period.
-        #[payable]
-        Deposit -> Timestamp uses (ctx, lock, mut balances, mut unlock_at, mut log) {
-            let owner = ctx.caller()
-            let amount = ctx.value()
-            assert!(amount > Wei::zero(), "Nothing to deposit")
-
-            let unlock = ctx.timestamp() + lock
-            balances.set(key: owner, value: balances.get(key: owner) + amount)
-            unlock_at.set(key: owner, value: unlock)
-            log.emit(Deposited { owner, amount, unlock_at: unlock })
-            unlock
-        }
-
-        Withdraw { to } -> Wei uses (ctx, mut call, mut balances, unlock_at, mut log) {
-            let owner = ctx.caller()
-            let amount = balances.get(key: owner)
-            assert!(amount > Wei::zero(), "Nothing to withdraw")
-            assert!(
-                ctx.timestamp() >= unlock_at.get(key: owner),
-                "Still locked",
-            )
-
-            // Update the balance before sending, so a reentrant call finds nothing.
-            balances.set(key: owner, value: Wei::zero())
-            assert!(
-                call.send_value(addr: to, gas: 0, value: amount).success(),
-                "Transfer failed",
-            )
-            log.emit(Withdrawn { owner, to, amount })
-            amount
-        }
-
-        BalanceOf { owner } -> Wei uses (balances) {
-            balances.get(key: owner)
-        }
-
-        UnlockTime { owner } -> Timestamp uses (unlock_at) {
-            unlock_at.get(key: owner)
-        }
-    }
-}
+pub use sealed::{AuctionMsg, SealedAuction}

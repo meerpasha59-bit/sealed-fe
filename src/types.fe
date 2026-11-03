@@ -1,0 +1,132 @@
+// The vocabulary of a sealed-bid auction, as types.
+//
+// Amounts are `Wei`, points in time are `Timestamp` and spans are `Duration`
+// (all from the std prelude), so `commit_end + reveal_end` or
+// `reserve + reveal_period` are type errors rather than bugs. A commitment is
+// its own newtype, so a raw salt or amount can't be stored where a hash
+// belongs, and the auction's phase is an enum that is *computed* from the
+// clock instead of being a flag someone has to remember to flip.
+
+use std::evm::keccak_words
+
+/// `keccak256(abi.encode(auction, bidder, amount, salt))`: what a bidder
+/// publishes during the commit phase. Binding the auction address and the
+/// bidder stops a commitment from being replayed by another account or in
+/// another auction.
+pub struct Commitment(pub u256)
+
+impl Commitment {
+    pub fn of(auction: Address, bidder: Address, amount: Wei, salt: u256) -> Self {
+        Commitment(
+            keccak_words([auction.word(), bidder.word(), amount.as_wei(), salt]),
+        )
+    }
+
+    pub fn none() -> Self {
+        Commitment(0)
+    }
+
+    pub fn is_none(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn matches(self, _ other: Commitment) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Copy for Commitment {}
+
+/// Where an auction is in its life. `Commit` and `Reveal` come from the
+/// clock; `Closed` means the reveal window is over and anyone may settle;
+/// `Settled` means settlement ran and withdrawals are open.
+pub enum Phase {
+    Commit,
+    Reveal,
+    Closed,
+    Settled,
+}
+
+impl Phase {
+    /// Stable numeric code for the ABI (`phase()` returns it).
+    pub fn code(self) -> u8 {
+        match self {
+            Phase::Commit => 0,
+            Phase::Reveal => 1,
+            Phase::Closed => 2,
+            Phase::Settled => 3,
+        }
+    }
+
+    pub fn is(self, _ other: Phase) -> bool {
+        self.code() == other.code()
+    }
+}
+
+/// The two deadlines of an auction. Commits are accepted while
+/// `now < commit_end`, reveals while `commit_end <= now < reveal_end`.
+pub struct Schedule { pub commit_end: Timestamp, pub reveal_end: Timestamp }
+
+impl Copy for Schedule {}
+
+impl Schedule {
+    /// Lay out the windows from a start time and two durations. Only a
+    /// `Duration` can be added to a `Timestamp`, so the types alone rule out
+    /// adding two deadlines together.
+    pub fn starting(at: Timestamp, commit_period: Duration, reveal_period: Duration) -> Self {
+        let commit_end = at + commit_period
+        Schedule { commit_end, reveal_end: commit_end + reveal_period }
+    }
+
+    /// The phase at `now`, ignoring settlement.
+    pub fn phase_at(self, _ now: Timestamp) -> Phase {
+        if now < self.commit_end {
+            Phase::Commit
+        } else if now < self.reveal_end {
+            Phase::Reveal
+        } else {
+            Phase::Closed
+        }
+    }
+
+    /// How long until the current window ends (zero once closed).
+    pub fn remaining(self, _ now: Timestamp) -> Duration {
+        if now < self.commit_end {
+            self.commit_end - now
+        } else if now < self.reveal_end {
+            self.reveal_end - now
+        } else {
+            Duration::zero()
+        }
+    }
+}
+
+/// A source of "now". Auction logic declares `uses (clock: Clock)` instead of
+/// reading the block directly, so the contract supplies the chain's time and
+/// tests supply any time they like with `with (Clock = ...)`: time travel
+/// without cheat codes.
+pub trait Clock {
+    fn now(self) -> Timestamp
+}
+
+/// A clock stopped at one instant. On the EVM every call in a transaction
+/// sees the same block timestamp, so this is exactly the chain's clock when
+/// built from `ctx.timestamp()`.
+pub struct FixedClock { pub at: Timestamp }
+
+impl Clock for FixedClock {
+    fn now(self) -> Timestamp {
+        self.at
+    }
+}
+
+/// The phase right now, settlement included.
+pub fn current_phase(schedule: Schedule, settled: bool) -> Phase
+uses (clock: Clock)
+{
+    if settled {
+        Phase::Settled
+    } else {
+        schedule.phase_at(clock.now())
+    }
+}
