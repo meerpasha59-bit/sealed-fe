@@ -2,8 +2,9 @@
 
 **Pitch:** A sealed-bid second-price (Vickrey) auction in Fe where money, time,
 commitments and auction phases are distinct types and "now" is an effect, so
-the classic auction bugs either fail to compile or are pinned down by 56
-tests, all run locally with `fe test` and no deployment.
+the classic auction bugs either fail to compile or are pinned down by 58
+tests, at gas parity with optimised Solidity, all run locally with `fe test`
+and no deployment.
 
 Built for the [Fe Builders Challenge](https://fe-lang.org/contest/) (project
 FE-005) by Pasha Meer.
@@ -120,7 +121,7 @@ checks that every one is rejected with the expected error.
 
 ```
 src/
-├── types.fe     Commitment(u256), Phase, Schedule, Clock + FixedClock, current_phase
+├── types.fe     Commitment(u256), Settlement(u256), Phase, Schedule, Clock + FixedClock
 ├── book.fe      Book (highest, second, winner): the second-price rule and payouts, pure
 ├── auction.fe   AuctionStore + transitions: commit, reveal, settle, take_payout
 │                (uses Clock + storage effects; Solidity-style custom errors)
@@ -132,6 +133,7 @@ src/
     ├── properties.fe  randomised auctions (KeccakRng) + pinned cases (ReplayRng)
     └── deployed.fe    the real SealedAuction with the block clock
 compile_fail/          six ingots that must NOT compile (typed-unit and effect misuse)
+bench/                 Solidity reference, gas.py (py-evm), RESULTS.md
 scripts/compile-fail.sh, scripts/demo.py
 ```
 
@@ -170,23 +172,72 @@ ABI (Solidity-compatible selectors): `commit(uint256)` (payable),
 curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh | bash -s -- --version v26.5.0
 fe --version              # fe 26.5.0 (3dab95f)
 
-fe test                   # 56 tests
+fe test                   # 58 tests
 fe build                  # writes out/SealedAuction.{bin,runtime.bin,abi.json}
 ./scripts/compile-fail.sh # 6 classic bugs, each rejected by the compiler
 python3 scripts/demo.py   # narrated auction (needs Python 3, stdlib only)
+
+# gas comparison (needs solc 0.8.28 on PATH)
+pip install -r bench/requirements.txt
+python3 bench/gas.py
 ```
 
 CI (`.github/workflows/ci.yml`) runs `fe fmt --check`, `fe test`, `fe build`
-and the compile-fail check on every push.
+and the compile-fail check on every push, and a second job reruns the gas
+comparison and posts the table to the run summary.
 
 ### Test coverage
 
 | File | Tests | What |
 | --- | --- | --- |
-| `unit.fe` | 18 | half-open phase boundaries, zero-length windows, countdowns, `Clock` effect, commitment = `keccak256(abi.encode(...))` test vector, every Book case (order independence, ties, reserve above/below/equal), payout conservation |
-| `lifecycle.fe` | 28 | full 3-bidder auction, forfeits, no sale, no bids, single bidder, ties, last-second commit/reveal, and each failure path asserted by its exact custom-error selector |
+| `unit.fe` | 19 | half-open phase boundaries, zero-length windows, countdowns, `Clock` effect, commitment = `keccak256(abi.encode(...))` test vector, every Book case (order independence, ties, reserve above/below/equal), payout conservation, the one-word `Settlement` encoding |
+| `lifecycle.fe` | 29 | full 3-bidder auction, forfeits, no sale, no bids, single bidder, lone bidder winning for free, ties, last-second commit/reveal, and each failure path asserted by its exact custom-error selector |
 | `properties.fe` | 3 | 12 random 5-bidder auctions (`KeccakRng`), plus all-equal-bids and nobody-reveals pinned with `ReplayRng`: winner, price and conservation of every wei |
 | `deployed.fe` | 7 | the real contract with the block clock: constructor, commit storage, phase guards, empty auction |
+
+## Gas: Fe vs. Solidity
+
+`bench/SealedAuction.sol` is the same auction written in idiomatic Solidity
+(same ABI, rules, errors and events). `bench/gas.py` deploys both on py-evm
+(Cancun rules) and plays the three-bidder auction from the demo with real
+signed transactions and block timestamps, asserting the same payouts on both.
+Gas used per transaction (intrinsic gas included):
+
+| Transaction | Fe -O1 | Fe -O2 | solc | solc via-IR | Fe -O2 vs best solc |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| deploy | 653,619 | 653,187 | 736,434 | 694,976 | -6.0% |
+| commit (first bidder) | 118,961 | 118,961 | 118,955 | 118,938 | +0.0% |
+| commit | 84,761 | 84,761 | 84,755 | 84,738 | +0.0% |
+| commit (3rd) | 84,761 | 84,761 | 84,755 | 84,738 | +0.0% |
+| reveal (first, leads) | 147,498 | 147,498 | 146,222 | 145,951 | +1.1% |
+| reveal (takes the lead) | 99,031 | 99,031 | 97,833 | 97,574 | +1.5% |
+| reveal (not leading) | 76,343 | 76,343 | 74,699 | 74,443 | +2.6% |
+| settle | 62,912 | 62,912 | 66,394 | 66,020 | -4.7% |
+| withdraw (loser) | 97,408 | 97,400 | 95,706 | 95,326 | +2.2% |
+| withdraw (winner) | 97,434 | 97,426 | 97,891 | 97,491 | -0.1% |
+| withdraw (loser, over-deposit) | 97,408 | 97,400 | 95,706 | 95,326 | +2.2% |
+| withdraw (seller) | 88,779 | 88,771 | 91,216 | 90,959 | -2.4% |
+| **all 11 auction txs** | **1,055,296** | **1,055,264** | **1,054,132** | **1,051,504** | **+0.4%** |
+| init code size (bytes) | 2,451 | 2,449 | 2,920 | 2,729 | |
+
+Fe is **at parity overall (+0.4% over the best solc pipeline across the
+auction, 6% cheaper to deploy, 10% smaller init code than via-IR)**: cheaper to settle and
+for the winner and seller to withdraw, 1–3% dearer on reveals and loser
+refunds.
+
+What the benchmark taught us (useful for any Fe contract): the first version
+was **+5.5% overall and +29% on `settle`**. Two Fe-level changes closed the
+gap:
+
+1. *One word, one type.* `settled: bool` plus `price: Wei` meant two fresh
+   20,000-gas `SSTORE`s at settlement (Solidity packs the bool into a shared
+   slot for free). `Settlement(u256)` stores `price + 1` in one word, with the
+   encoding private to the newtype, so it costs one `SSTORE` and stays
+   impossible to misuse.
+2. *Don't copy storage structs on hot paths.* Calling a method on
+   `store.schedule` loads every field of the struct; the phase check now
+   tests settlement first and reads `commit_end` / `reveal_end` individually,
+   so a commit touches one deadline slot and calls after settlement touch none.
 
 ## Demo
 
@@ -238,6 +289,10 @@ Every wei deposited (19 ETH) was paid out exactly once; the contract ends empty.
   on settlement.
 - **Block timestamps** are trusted to within the usual few seconds of proposer
   freedom.
+- Payouts are sent with the 2,300-gas stipend (`send_value` with `gas: 0`),
+  so a recipient contract with an expensive `receive` can't take ETH; the
+  `withdraw(to)` argument lets such an account pick another recipient. (The
+  gas benchmark found that sending to a precompile address fails this way.)
 - `fe build` also emits the test-only `TimedAuction` and `Bidder` contracts;
   only `SealedAuction` is meant to be deployed.
 - Not audited. Not deployed anywhere: everything runs on Fe's local test EVM.
@@ -253,7 +308,9 @@ Every wei deposited (19 ETH) was paid out exactly once; the contract ends empty.
 - **Third-party code:** None copied. The project uses the Fe standard library
   (`std::evm` units, `keccak_words`, `random`, `StorageMap`), the starter's CI
   workflow and Apache-2.0 licence. `scripts/demo.py` uses only the Python
-  standard library.
+  standard library; `bench/gas.py` uses py-evm (MIT) and solc (GPL-3.0, run
+  as a tool only). The Solidity reference contract was written for this
+  project.
 - **AI assistance:** Written with substantial help from an AI assistant
   (Hark), which drafted code, tests and documentation under Pasha Meer's
   direction. Every claim here is backed by tests that run in CI; Pasha Meer is
