@@ -10,8 +10,18 @@
 // address (`ctx.caller()` in the auction).
 
 use ingot::AuctionMsg
-use ingot::types::{Clock, Commitment, FixedClock, Schedule, current_phase}
-use ingot::auction::{AuctionStore, claimable, commit, reveal, settle, setup, take_payout}
+use ingot::types::{Clock, Commitment, FixedClock, Schedule}
+use ingot::auction::{
+    AuctionStore,
+    claimable,
+    commit,
+    phase,
+    reveal,
+    settle,
+    setup,
+    take_payout,
+    winner,
+}
 
 pub msg WarpMsg {
     #[selector = sol("warp(uint256)")]
@@ -78,19 +88,17 @@ pub contract TimedAuction uses (ctx: Ctx, call: mut Call) {
             amount
         }
         Phase -> u8 uses (store, now) {
-            with (Clock = FixedClock { at: now }) {
-                current_phase(schedule: store.schedule, settled: store.settled).code()
+            with (Clock = FixedClock { at: now }, store) {
+                phase().code()
             }
         }
         Winner -> Address uses (store) {
-            if store.settled && store.price == Wei::zero() {
-                Address::zero()
-            } else {
-                store.book.winner
+            with (store) {
+                winner()
             }
         }
         Price -> Wei uses (store) {
-            store.price
+            store.settlement.price()
         }
         HighestBid -> Wei uses (store) {
             store.book.highest

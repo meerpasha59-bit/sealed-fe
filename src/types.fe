@@ -7,7 +7,7 @@
 // belongs, and the auction's phase is an enum that is *computed* from the
 // clock instead of being a flag someone has to remember to flip.
 
-use std::evm::keccak_words
+use std::evm::{keccak_words, wei}
 
 /// `keccak256(abi.encode(auction, bidder, amount, salt))`: what a bidder
 /// publishes during the commit phase. Binding the auction address and the
@@ -36,6 +36,37 @@ impl Commitment {
 }
 
 impl Copy for Commitment {}
+
+/// The outcome of an auction in one storage word: `0` while it runs,
+/// `price + 1` once it is settled. A separate `settled: bool` next to a
+/// `price: Wei` would cost a second 20,000-gas `SSTORE` at settlement; the
+/// field is private, so the `+ 1` encoding can't leak out of these methods.
+pub struct Settlement(u256)
+
+impl Settlement {
+    pub fn pending() -> Self {
+        Settlement(0)
+    }
+
+    pub fn at(_ price: Wei) -> Self {
+        Settlement(price.as_wei() + 1)
+    }
+
+    pub fn is_settled(self) -> bool {
+        self.0 != 0
+    }
+
+    /// The clearing price (zero while pending or when nothing sold).
+    pub fn price(self) -> Wei {
+        if self.0 == 0 {
+            Wei::zero()
+        } else {
+            wei(self.0 - 1)
+        }
+    }
+}
+
+impl Copy for Settlement {}
 
 /// Where an auction is in its life. `Commit` and `Reveal` come from the
 /// clock; `Closed` means the reveal window is over and anyone may settle;

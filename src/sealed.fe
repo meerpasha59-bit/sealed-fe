@@ -2,8 +2,18 @@
 // block's clock, emits events and moves ETH. All the rules live in
 // `auction.fe`.
 
-use ingot::types::{Clock, Commitment, FixedClock, Schedule, current_phase}
-use ingot::auction::{AuctionStore, claimable, commit, reveal, settle, setup, take_payout}
+use ingot::types::{Clock, Commitment, FixedClock, Schedule}
+use ingot::auction::{
+    AuctionStore,
+    claimable,
+    commit,
+    phase,
+    reveal,
+    settle,
+    setup,
+    take_payout,
+    winner,
+}
 
 pub msg AuctionMsg {
     #[selector = sol("commit(uint256)")]
@@ -119,10 +129,8 @@ pub contract SealedAuction uses (ctx: Ctx, call: mut Call, log: mut Log) {
             let price = with (Clock = FixedClock { at: ctx.timestamp() }, store) {
                 settle()
             }
-            let winner = if price == Wei::zero() {
-                Address::zero()
-            } else {
-                store.book.winner
+            let winner = with (store) {
+                winner()
             }
             log.emit(
                 Settled { winner, price, bidders: store.bidders, reveals: store.book.reveals },
@@ -144,20 +152,18 @@ pub contract SealedAuction uses (ctx: Ctx, call: mut Call, log: mut Log) {
         }
 
         Phase -> u8 uses (ctx, store) {
-            with (Clock = FixedClock { at: ctx.timestamp() }) {
-                current_phase(schedule: store.schedule, settled: store.settled).code()
+            with (Clock = FixedClock { at: ctx.timestamp() }, store) {
+                phase().code()
             }
         }
 
         Winner -> Address uses (store) {
-            if store.settled && store.price == Wei::zero() {
-                Address::zero()
-            } else {
-                store.book.winner
+            with (store) {
+                winner()
             }
         }
         Price -> Wei uses (store) {
-            store.price
+            store.settlement.price()
         }
         HighestBid -> Wei uses (store) {
             store.book.highest

@@ -4,7 +4,7 @@
 // very same functions below.
 
 use std::evm::{StorageMap, revert_error}
-use ingot::types::{Clock, Commitment, Phase, Schedule, current_phase}
+use ingot::types::{Clock, Commitment, Phase, Schedule, Settlement}
 use ingot::book::{Book, bidder_payout, seller_payout}
 
 // -----------------------------------------------------------------------------
@@ -57,9 +57,8 @@ pub struct AuctionStore {
     pub seller: Address,
     pub schedule: Schedule,
     pub reserve: Wei,
-    pub settled: bool,
+    pub settlement: Settlement,
     pub book: Book,
-    pub price: Wei,
     pub bidders: u256,
     pub total_deposits: Wei,
     pub revealed_deposits: Wei,
@@ -73,9 +72,26 @@ pub struct AuctionStore {
 // Transitions
 // -----------------------------------------------------------------------------
 
+/// The auction's phase right now. Settlement is checked first, so calls after
+/// settlement never touch the schedule's storage slots, and the deadlines are
+/// read one at a time, so a commit reads only `commit_end`.
+pub fn phase() -> Phase uses (clock: Clock, store: AuctionStore) {
+    if store.settlement.is_settled() {
+        return Phase::Settled
+    }
+    let now = clock.now()
+    if now < store.schedule.commit_end {
+        Phase::Commit
+    } else if now < store.schedule.reveal_end {
+        Phase::Reveal
+    } else {
+        Phase::Closed
+    }
+}
+
 /// Revert unless the auction is in `expected` right now.
 pub fn require_phase(_ expected: Phase) uses (clock: Clock, store: AuctionStore) {
-    let actual = current_phase(schedule: store.schedule, settled: store.settled)
+    let actual = phase()
     if !actual.is(expected) {
         revert_error(
             WrongPhase { expected: expected.code(), actual: actual.code() },
@@ -90,6 +106,7 @@ uses (store: mut AuctionStore)
     store.schedule = schedule
     store.reserve = reserve
     store.book = Book::empty()
+    store.settlement = Settlement::pending()
 }
 
 /// Lock a sealed bid. `deposit` may exceed the bid to hide its size; the
@@ -143,30 +160,39 @@ uses (clock: Clock, store: mut AuctionStore)
 pub fn settle() -> Wei uses (clock: Clock, store: mut AuctionStore) {
     require_phase(Phase::Closed)
     let price = store.book.clearing_price(reserve: store.reserve)
-    store.price = price
-    store.settled = true
+    store.settlement = Settlement::at(price)
     price
+}
+
+/// The leading bidder if their bid meets the reserve, otherwise nobody. After
+/// settlement this is the winner (who may pay zero: a lone bidder with no
+/// reserve wins for free, as second-price rules say).
+pub fn winner() -> Address uses (store: AuctionStore) {
+    if store.book.sold(reserve: store.reserve) {
+        store.book.winner
+    } else {
+        Address::zero()
+    }
 }
 
 /// What `account` may withdraw now (zero before settlement or after
 /// withdrawing).
 pub fn claimable(_ account: Address) -> Wei uses (store: AuctionStore) {
-    if !store.settled || store.withdrawn.get(key: account) {
+    if !store.settlement.is_settled() || store.withdrawn.get(key: account) {
         return Wei::zero()
     }
     if account == store.seller {
         return seller_payout(
-            price: store.price,
+            price: store.settlement.price(),
             total_deposits: store.total_deposits,
             revealed_deposits: store.revealed_deposits,
         )
     }
-    let sold = store.book.sold(reserve: store.reserve)
     bidder_payout(
         deposit: store.deposits.get(key: account),
         revealed: store.revealed.get(key: account),
-        is_winner: sold && store.book.winner == account,
-        price: store.price,
+        is_winner: winner() == account,
+        price: store.settlement.price(),
     )
 }
 
